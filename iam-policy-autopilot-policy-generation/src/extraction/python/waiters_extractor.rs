@@ -5,7 +5,8 @@
 //! on the waiter with operation arguments.
 
 use crate::extraction::python::common::{ArgumentExtractor, ParameterFilter};
-use crate::extraction::{Parameter, ParameterValue, SdkMethodCall, SdkMethodCallMetadata};
+use crate::extraction::shared::waiter_resolver::{WaiterCallInfo, WaiterResolver};
+use crate::extraction::{Parameter, SdkMethodCall};
 use crate::ServiceModelIndex;
 use ast_grep_language::Python;
 
@@ -20,23 +21,6 @@ pub(crate) struct WaiterInfo {
     pub client_receiver: String,
     /// Line number where get_waiter was called
     pub get_waiter_line: usize,
-}
-
-// TODO: This should be refactored at a higher level, so this type can be removed.
-// See https://github.com/awslabs/iam-policy-autopilot/issues/88.
-enum CallInfo<'a> {
-    None(&'a WaiterInfo),
-    Simple(&'a WaiterInfo, &'a WaitCallInfo),
-    Chained(&'a ChainedWaiterCallInfo),
-}
-
-impl<'a> CallInfo<'a> {
-    fn waiter_name(&self) -> &'a str {
-        match self {
-            Self::None(waiter_info) | Self::Simple(waiter_info, ..) => &waiter_info.waiter_name,
-            Self::Chained(waiter_call_info) => &waiter_call_info.waiter_name,
-        }
-    }
 }
 
 /// Information about a wait method call
@@ -332,87 +316,38 @@ impl<'a> WaitersExtractor<'a> {
 
     /// Create synthetic SdkMethodCalls for a matched waiter + wait
     /// Creates one call per candidate service with the actual operation name
-    fn create_synthetic_calls_internal(
-        &self,
-        wait_call: CallInfo,
-        receiver: Option<String>,
-    ) -> Vec<SdkMethodCall> {
-        let mut synthetic_calls = Vec::new();
-
-        // Get the operation for this service+waiter combination from service definition
-        if let Some(service_defs) = self
-            .service_index
-            .waiter_lookup
-            .get(wait_call.waiter_name())
-        {
-            for service_method in service_defs {
-                let (parameters, start_position, end_position) = match wait_call {
-                    CallInfo::Simple(_, wait_call) => {
-                        // Filter out WaiterConfig from arguments - it's waiter-specific, not operation-specific
-                        (
-                            ParameterFilter::filter_waiter_parameters(wait_call.arguments.clone()),
-                            wait_call.start_position,
-                            wait_call.end_position,
-                        )
-                    }
-                    CallInfo::Chained(chained_wait_call) => {
-                        // Filter out WaiterConfig from arguments - it's waiter-specific, not operation-specific
-                        (
-                            ParameterFilter::filter_waiter_parameters(
-                                chained_wait_call.arguments.clone(),
-                            ),
-                            // Use wait call position (most specific)
-                            chained_wait_call.start_position,
-                            chained_wait_call.end_position,
-                        )
-                    }
-                    CallInfo::None(waiter_info) => {
-                        let fallback_start_pos = (waiter_info.get_waiter_line, 1);
-                        let fallback_end_pos = (waiter_info.get_waiter_line, 1);
-                        let parameters = self.get_required_parameters(
-                            &service_method.service_name,
-                            &service_method.operation_name,
-                            self.service_index,
-                        );
-                        (parameters, fallback_start_pos, fallback_end_pos)
-                    }
-                };
-
-                // Create synthetic call with filtered wait() arguments
-                synthetic_calls.push(SdkMethodCall {
-                    name: wait_call.waiter_name().to_string(),
-                    possible_services: vec![service_method.service_name.clone()],
-                    metadata: Some(SdkMethodCallMetadata {
-                        parameters,
-                        return_type: None,
-                        start_position,
-                        end_position,
-                        // Use client receiver from get_waiter call
-                        receiver: receiver.clone(),
-                    }),
-                });
-            }
-        }
-
-        synthetic_calls
-    }
-
     fn create_matched_synthetic_calls(
         &self,
         wait_call: &WaitCallInfo,
         waiter_info: &WaiterInfo,
     ) -> Vec<SdkMethodCall> {
-        self.create_synthetic_calls_internal(
-            CallInfo::Simple(waiter_info, wait_call),
-            Some(waiter_info.client_receiver.clone()),
-        )
+        let resolver = WaiterResolver::new(self.service_index);
+
+        // Filter out WaiterConfig from arguments - it's waiter-specific, not operation-specific
+        let filtered_parameters =
+            ParameterFilter::filter_waiter_parameters(wait_call.arguments.clone());
+
+        let waiter_call_info = WaiterCallInfo {
+            waiter_name: waiter_info.waiter_name.clone(),
+            parameters: filtered_parameters,
+            start_position: wait_call.start_position,
+            end_position: wait_call.end_position,
+            receiver: Some(waiter_info.client_receiver.clone()),
+            possible_services: None,
+        };
+
+        resolver.create_synthetic_calls(&waiter_call_info)
     }
 
     /// Create synthetic SdkMethodCalls for an unmatched get_waiter
     fn create_unmatched_synthetic_calls(&self, waiter_info: &WaiterInfo) -> Vec<SdkMethodCall> {
-        self.create_synthetic_calls_internal(
-            CallInfo::None(waiter_info),
+        let resolver = WaiterResolver::new(self.service_index);
+
+        resolver.create_fallback_synthetic_calls(
+            &waiter_info.waiter_name,
+            (waiter_info.get_waiter_line, 1),
             Some(waiter_info.client_receiver.clone()),
+            None,
         )
     }
 
@@ -422,44 +357,22 @@ impl<'a> WaitersExtractor<'a> {
         &self,
         chained_call: &ChainedWaiterCallInfo,
     ) -> Vec<SdkMethodCall> {
-        self.create_synthetic_calls_internal(
-            CallInfo::Chained(chained_call),
-            Some(chained_call.client_receiver.clone()),
-        )
-    }
+        let resolver = WaiterResolver::new(self.service_index);
 
-    /// Get required parameters for an operation from the service index
-    fn get_required_parameters(
-        &self,
-        service_name: &str,
-        operation_name: &str,
-        service_index: &ServiceModelIndex,
-    ) -> Vec<Parameter> {
-        let mut parameters = Vec::new();
+        // Filter out WaiterConfig from arguments - it's waiter-specific, not operation-specific
+        let filtered_parameters =
+            ParameterFilter::filter_waiter_parameters(chained_call.arguments.clone());
 
-        // Look up the service and operation in the service index
-        if let Some(service_def) = service_index.services.get(service_name) {
-            if let Some(operation) = service_def.operations.get(operation_name) {
-                // Get the input shape if it exists
-                if let Some(input_ref) = &operation.input {
-                    if let Some(input_shape) = service_def.shapes.get(&input_ref.shape) {
-                        // Extract required parameters
-                        if let Some(required_params) = &input_shape.required {
-                            for (position, param_name) in required_params.iter().enumerate() {
-                                parameters.push(Parameter::Keyword {
-                                    name: param_name.clone(),
-                                    value: ParameterValue::Unresolved("<unknown>".to_string()), // Placeholder for required param
-                                    position,
-                                    type_annotation: None,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let waiter_call_info = WaiterCallInfo {
+            waiter_name: chained_call.waiter_name.clone(),
+            parameters: filtered_parameters,
+            start_position: chained_call.start_position,
+            end_position: chained_call.end_position,
+            receiver: Some(chained_call.client_receiver.clone()),
+            possible_services: None,
+        };
 
-        parameters
+        resolver.create_synthetic_calls(&waiter_call_info)
     }
 
     /// Extract a quoted string, handling both single and double quotes

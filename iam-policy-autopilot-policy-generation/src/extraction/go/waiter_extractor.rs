@@ -4,6 +4,7 @@
 //! creating a waiter from a client, then calling Wait() on the waiter.
 
 use crate::extraction::go::utils;
+use crate::extraction::shared::waiter_resolver::{WaiterCallInfo, WaiterResolver};
 use crate::extraction::{Parameter, ParameterValue, SdkMethodCall, SdkMethodCallMetadata};
 use crate::ServiceModelIndex;
 use ast_grep_language::Go;
@@ -235,51 +236,35 @@ impl<'a> GoWaiterExtractor<'a> {
         wait_call: Option<&WaitCallInfo>,
         waiter_info: &WaiterInfo,
     ) -> Vec<SdkMethodCall> {
-        let mut synthetic_calls = Vec::new();
+        let resolver = WaiterResolver::new(self.service_index);
 
-        // waiter_type already contains the clean waiter name (e.g., "InstanceTerminated")
-        if let Some(service_defs) = self
-            .service_index
-            .waiter_lookup
-            .get(&waiter_info.waiter_type)
-        {
-            // Create one call per service
-            for service_def in service_defs {
-                let service_name = &service_def.service_name;
-                let operation_name = &service_def.operation_name;
+        match wait_call {
+            Some(wait_call) => {
+                // Filter out Go waiter-specific parameters (keep context and input struct)
+                let filtered_parameters =
+                    self.filter_waiter_parameters(wait_call.arguments.clone());
 
-                let (parameters, start_position, end_position) = match wait_call {
-                    Some(wait_call) => (
-                        self.filter_waiter_parameters(wait_call.arguments.clone()),
-                        wait_call.start_position,
-                        wait_call.end_position,
-                    ),
-                    None => {
-                        // Fallback:
-                        (
-                            // Get required parameters for this operation
-                            self.get_required_parameters(service_name, operation_name),
-                            (waiter_info.creation_line, 1),
-                            (waiter_info.creation_line, 1),
-                        )
-                    }
+                let waiter_call_info = WaiterCallInfo {
+                    waiter_name: waiter_info.waiter_type.clone(),
+                    parameters: filtered_parameters,
+                    start_position: wait_call.start_position,
+                    end_position: wait_call.end_position,
+                    receiver: Some(waiter_info.client_receiver.clone()),
+                    possible_services: None,
                 };
 
-                synthetic_calls.push(SdkMethodCall {
-                    name: operation_name.clone(),
-                    possible_services: vec![service_name.clone()], // Single service per call
-                    metadata: Some(SdkMethodCallMetadata {
-                        parameters,
-                        return_type: None,
-                        start_position,
-                        end_position,
-                        receiver: Some(waiter_info.client_receiver.clone()),
-                    }),
-                });
+                resolver.create_synthetic_calls(&waiter_call_info)
+            }
+            None => {
+                // Fallback for unmatched waiter creation
+                resolver.create_fallback_synthetic_calls(
+                    &waiter_info.waiter_type,
+                    (waiter_info.creation_line, 1),
+                    Some(waiter_info.client_receiver.clone()),
+                    None,
+                )
             }
         }
-
-        synthetic_calls
     }
 
     /// Create synthetic SdkMethodCall objects from a matched waiter + wait
@@ -294,19 +279,51 @@ impl<'a> GoWaiterExtractor<'a> {
     /// Create fallback synthetic calls for unmatched waiter creation
     /// Returns one call per service that has the waiter, matching Python behavior
     fn create_fallback_synthetic_call(&self, waiter_info: &WaiterInfo) -> Vec<SdkMethodCall> {
-        self.create_synthetic_call_internal(None, waiter_info)
+        // For Go, we need to create Positional parameters instead of Keyword parameters
+        // So we'll create the calls manually with Go-specific parameter format
+        let mut synthetic_calls = Vec::new();
+
+        if let Some(service_defs) = self
+            .service_index
+            .waiter_lookup
+            .get(&waiter_info.waiter_type)
+        {
+            for service_def in service_defs {
+                // Get required parameters in Go format (Positional)
+                let required_params = self.get_go_required_parameters(
+                    &service_def.service_name,
+                    &service_def.operation_name,
+                );
+
+                synthetic_calls.push(SdkMethodCall {
+                    name: service_def.operation_name.clone(),
+                    possible_services: vec![service_def.service_name.clone()],
+                    metadata: Some(SdkMethodCallMetadata {
+                        parameters: required_params,
+                        return_type: None,
+                        start_position: (waiter_info.creation_line, 1),
+                        end_position: (waiter_info.creation_line, 1),
+                        receiver: Some(waiter_info.client_receiver.clone()),
+                    }),
+                });
+            }
+        }
+
+        synthetic_calls
     }
 
-    /// Get required parameters for an operation from the service index
-    fn get_required_parameters(&self, service_name: &str, operation_name: &str) -> Vec<Parameter> {
+    /// Get required parameters for an operation in Go format (Positional parameters)
+    fn get_go_required_parameters(
+        &self,
+        service_name: &str,
+        operation_name: &str,
+    ) -> Vec<Parameter> {
         let mut parameters = Vec::new();
 
         if let Some(service_def) = self.service_index.services.get(service_name) {
             if let Some(operation) = service_def.operations.get(operation_name) {
-                // Get the input shape if it exists
                 if let Some(input_ref) = &operation.input {
                     if let Some(input_shape) = service_def.shapes.get(&input_ref.shape) {
-                        // Extract required parameters
                         if let Some(required_params) = &input_shape.required {
                             for (position, param_name) in required_params.iter().enumerate() {
                                 parameters.push(Parameter::Positional {

@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use crate::extraction::extractor::{Extractor, ExtractorResult};
 use crate::extraction::javascript::scanner::ASTScanner;
 use crate::extraction::javascript::shared::ExtractionUtils;
+use crate::extraction::shared::waiter_resolver::WaiterResolver;
 use crate::ServiceModelIndex;
 
 /// TypeScript extractor for AWS SDK method calls
@@ -76,25 +77,30 @@ impl Extractor for TypeScriptExtractor {
                 }
             };
 
-            // For each call, check if it's a waiter name and replace with the actual operation
-            for call in method_calls.iter_mut() {
-                if let Some(service_methods) = service_index.waiter_lookup.get(&call.name) {
-                    let matching_method = service_methods
-                        .iter()
-                        .find(|sm| call.possible_services.contains(&sm.service_name));
+            // For each call, check if it's a waiter name and replace with the actual operation using shared resolver
+            let resolver = WaiterResolver::new(service_index);
 
-                    if let Some(method) = matching_method {
-                        call.name = method.operation_name.clone();
-                    } else {
-                        log::warn!(
-                            "Waiter '{}' found in services {:?} but imported from {:?}",
-                            call.name,
-                            service_methods
-                                .iter()
-                                .map(|sm| &sm.service_name)
-                                .collect::<Vec<_>>(),
-                            call.possible_services
-                        );
+            for call in method_calls.iter_mut() {
+                if resolver.is_waiter(&call.name) {
+                    // Find the matching service method for this waiter
+                    if let Some(service_methods) = service_index.waiter_lookup.get(&call.name) {
+                        let matching_method = service_methods
+                            .iter()
+                            .find(|sm| call.possible_services.contains(&sm.service_name));
+
+                        if let Some(method) = matching_method {
+                            call.name = method.operation_name.clone();
+                        } else {
+                            log::warn!(
+                                "Waiter '{}' found in services {:?} but imported from {:?}",
+                                call.name,
+                                service_methods
+                                    .iter()
+                                    .map(|sm| &sm.service_name)
+                                    .collect::<Vec<_>>(),
+                                call.possible_services
+                            );
+                        }
                     }
                 }
             }
