@@ -92,6 +92,10 @@ pub(crate) struct VariableTypeTracker {
     /// All assignment target names per function, used to detect local shadowing
     /// of module-level session variables.
     pub(super) local_assignments: HashMap<String, HashSet<String>>,
+
+    /// Tracked function return types: function_name -> return type info.
+    /// Only populated when all return paths in a function agree on the same type.
+    pub(super) function_return_types: HashMap<String, VariableTypeInfo>,
 }
 
 impl VariableTypeTracker {
@@ -103,6 +107,7 @@ impl VariableTypeTracker {
             conflicted_functions: HashSet::new(),
             session_variables: HashMap::new(),
             local_assignments: HashMap::new(),
+            function_return_types: HashMap::new(),
         }
     }
 }

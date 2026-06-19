@@ -15,6 +15,7 @@ impl VariableTypeTracker {
     /// 4. **Aliases**: `my_client = s3_client` at module and function level
     /// 5. **Function calls**: Infer parameter types from arguments at call sites
     /// 6. **Resource-derived variables**: `table = dynamodb.Table('name')`, `bucket = s3.Bucket('name')`
+    /// 7. **Function return values**: `def f(): return boto3.client('s3')` then `x = f()`
     pub(crate) fn track_boto3_assignments(&mut self, ast: &AstWithSourceFile<Python>) {
         let root = ast.ast.root();
 
@@ -28,6 +29,8 @@ impl VariableTypeTracker {
         self.track_aliases(&root);
         self.track_function_calls(&root);
         self.track_resource_derived_variables(&root);
+        self.track_function_return_types(&root);
+        self.track_return_value_assignments(&root);
     }
 
     /// Detect top-level function names that appear multiple times in the file.
@@ -856,6 +859,319 @@ impl VariableTypeTracker {
         }
     }
 
+    /// Track function return types by analyzing return statements.
+    ///
+    /// For each function, inspects all return statements and attempts to resolve
+    /// the returned expression to a tracked type. Only records the return type if
+    /// **every** return path resolves to the same service. If any return is
+    /// unresolved (bare `return`, unknown variable, arbitrary expression) or
+    /// disagrees with others, the function is skipped — consistent with IPA's
+    /// overapproximation philosophy (don't narrow unless certain).
+    ///
+    /// Supported return patterns:
+    /// - `return boto3.client('s3')`
+    /// - `return boto3.resource('dynamodb')`
+    /// - `return session.client('s3')` (where session is a known boto3.Session)
+    /// - `return some_var` (where some_var is tracked in the function or module scope)
+    fn track_function_return_types(
+        &mut self,
+        root: &ast_grep_core::Node<ast_grep_core::tree_sitter::StrDoc<Python>>,
+    ) {
+        let func_def_pattern = "def $FUNC($$$): $$$BODY";
+
+        for func_match in root.find_all(func_def_pattern) {
+            if is_method(&func_match) {
+                continue;
+            }
+
+            let env = func_match.get_env();
+            let func_name = if let Some(node) = env.get_match("FUNC") {
+                node.text().to_string()
+            } else {
+                continue;
+            };
+
+            if self.conflicted_functions.contains(&func_name) {
+                continue;
+            }
+
+            let caller_node_id = func_match.get_node().node_id();
+            let mut resolved_type: Option<VariableTypeInfo> = None;
+            let mut resolved_count: usize = 0;
+            let mut ambiguous = false;
+
+            // Pattern: return boto3.client('service') / boto3.resource('service')
+            for factory in &["client", "resource"] {
+                let return_pattern = format!("return boto3.{factory}($$$ARGS)");
+                for node_match in func_match.get_node().find_all(return_pattern.as_str()) {
+                    if has_intervening_function(&node_match, caller_node_id) {
+                        continue;
+                    }
+                    let ret_env = node_match.get_env();
+                    if let Some(service) = Self::extract_first_positional_string_arg(ret_env) {
+                        let kind = if *factory == "client" {
+                            SdkObjectKind::Client
+                        } else {
+                            SdkObjectKind::Resource
+                        };
+                        let info = VariableTypeInfo::from_service_with_kind(service, kind);
+                        match &resolved_type {
+                            None => resolved_type = Some(info),
+                            Some(existing) if existing == &info => {}
+                            _ => {
+                                ambiguous = true;
+                                break;
+                            }
+                        }
+                        resolved_count += 1;
+                    }
+                }
+                if ambiguous {
+                    break;
+                }
+            }
+
+            // Pattern: return session.client('service') / session.resource('service')
+            if !ambiguous {
+                for factory in &["client", "resource"] {
+                    let return_pattern = format!("return $SESSION.{factory}($$$ARGS)");
+                    for node_match in func_match.get_node().find_all(return_pattern.as_str()) {
+                        if has_intervening_function(&node_match, caller_node_id) {
+                            continue;
+                        }
+                        let ret_env = node_match.get_env();
+                        let session_name = if let Some(node) = ret_env.get_match("SESSION") {
+                            node.text().to_string()
+                        } else {
+                            continue;
+                        };
+
+                        // Skip if "SESSION" matched "boto3" (already handled above)
+                        if session_name == "boto3" {
+                            continue;
+                        }
+
+                        let is_valid_session = self
+                            .session_variables
+                            .get(&Some(func_name.clone()))
+                            .is_some_and(|vars| vars.contains(&session_name))
+                            || {
+                                let locally_shadowed = self
+                                    .local_assignments
+                                    .get(&func_name)
+                                    .is_some_and(|vars| vars.contains(&session_name));
+                                !locally_shadowed
+                                    && self
+                                        .session_variables
+                                        .get(&None)
+                                        .is_some_and(|vars| vars.contains(&session_name))
+                            };
+
+                        if !is_valid_session {
+                            continue;
+                        }
+
+                        if let Some(service) = Self::extract_first_positional_string_arg(ret_env) {
+                            let kind = if *factory == "client" {
+                                SdkObjectKind::Client
+                            } else {
+                                SdkObjectKind::Resource
+                            };
+                            let info = VariableTypeInfo::from_service_with_kind(service, kind);
+                            match &resolved_type {
+                                None => resolved_type = Some(info),
+                                Some(existing) if existing == &info => {}
+                                _ => {
+                                    ambiguous = true;
+                                    break;
+                                }
+                            }
+                            resolved_count += 1;
+                        }
+                    }
+                    if ambiguous {
+                        break;
+                    }
+                }
+            }
+
+            // Pattern: return some_var (where some_var is already tracked)
+            if !ambiguous {
+                let return_var_pattern = "return $VAR";
+                for node_match in func_match.get_node().find_all(return_var_pattern) {
+                    if has_intervening_function(&node_match, caller_node_id) {
+                        continue;
+                    }
+                    let ret_env = node_match.get_env();
+                    let var_node = if let Some(node) = ret_env.get_match("VAR") {
+                        node
+                    } else {
+                        continue;
+                    };
+
+                    if var_node.kind() != node_kinds::IDENTIFIER {
+                        continue;
+                    }
+
+                    let var_name = var_node.text().to_string();
+                    if let Some(type_info) =
+                        self.get_type_info_for_variable_in_context(&var_name, Some(&func_name))
+                    {
+                        let info = type_info.clone();
+                        match &resolved_type {
+                            None => resolved_type = Some(info),
+                            Some(existing) if existing == &info => {}
+                            _ => {
+                                ambiguous = true;
+                                break;
+                            }
+                        }
+                        resolved_count += 1;
+                    }
+                }
+            }
+
+            // Count total return statements in this function (excluding nested functions).
+            // If any returns are unresolved, we can't be certain about the return type.
+            if !ambiguous && resolved_type.is_some() {
+                let total_returns = count_return_statements(&func_match, caller_node_id);
+                if resolved_count < total_returns {
+                    log::debug!(
+                        "Function '{}' has {} return(s) but only {} resolved — skipping",
+                        func_name,
+                        total_returns,
+                        resolved_count
+                    );
+                    ambiguous = true;
+                }
+            }
+
+            if !ambiguous {
+                if let Some(type_info) = resolved_type {
+                    log::debug!(
+                        "Tracked return type for function '{}': service '{}' ({:?})",
+                        func_name,
+                        type_info.service_name,
+                        type_info.kind
+                    );
+                    self.function_return_types.insert(func_name, type_info);
+                }
+            }
+        }
+    }
+
+    /// Track assignments from function call return values.
+    ///
+    /// Pattern: `var = func_name(...)` where func_name has a known return type.
+    /// Works at both module and function level.
+    fn track_return_value_assignments(
+        &mut self,
+        root: &ast_grep_core::Node<ast_grep_core::tree_sitter::StrDoc<Python>>,
+    ) {
+        let assign_call_pattern = "$VAR = $FUNC($$$ARGS)";
+
+        // Function-level assignments
+        let func_def_pattern = "def $FUNC($$$): $$$BODY";
+        for func_match in root.find_all(func_def_pattern) {
+            let env = func_match.get_env();
+            let enclosing_func = if let Some(node) = env.get_match("FUNC") {
+                node.text().to_string()
+            } else {
+                continue;
+            };
+
+            let caller_node_id = func_match.get_node().node_id();
+            for node_match in func_match.get_node().find_all(assign_call_pattern) {
+                if has_intervening_function(&node_match, caller_node_id) {
+                    continue;
+                }
+
+                let assign_env = node_match.get_env();
+                let var_name = if let Some(node) = assign_env.get_match("VAR") {
+                    if node.kind() != node_kinds::IDENTIFIER {
+                        continue;
+                    }
+                    node.text().to_string()
+                } else {
+                    continue;
+                };
+
+                let called_func = if let Some(node) = assign_env.get_match("FUNC") {
+                    if node.kind() != node_kinds::IDENTIFIER {
+                        continue;
+                    }
+                    node.text().to_string()
+                } else {
+                    continue;
+                };
+
+                // Skip if already tracked (direct assignment takes priority)
+                if self
+                    .function_scopes
+                    .get(&enclosing_func)
+                    .is_some_and(|scope| scope.contains_key(&var_name))
+                {
+                    continue;
+                }
+
+                if let Some(return_type) = self.function_return_types.get(&called_func) {
+                    log::debug!(
+                        "Tracked return value assignment in function '{}': {} = {}() -> service '{}'",
+                        enclosing_func,
+                        var_name,
+                        called_func,
+                        return_type.service_name
+                    );
+                    self.function_scopes
+                        .entry(enclosing_func.clone())
+                        .or_default()
+                        .insert(var_name, return_type.clone());
+                }
+            }
+        }
+
+        // Module-level assignments
+        for node_match in root.find_all(assign_call_pattern) {
+            if is_inside_function(&node_match) {
+                continue;
+            }
+
+            let env = node_match.get_env();
+            let var_name = if let Some(node) = env.get_match("VAR") {
+                if node.kind() != node_kinds::IDENTIFIER {
+                    continue;
+                }
+                node.text().to_string()
+            } else {
+                continue;
+            };
+
+            // Skip if already tracked
+            if self.module_scope.contains_key(&var_name) {
+                continue;
+            }
+
+            let called_func = if let Some(node) = env.get_match("FUNC") {
+                if node.kind() != node_kinds::IDENTIFIER {
+                    continue;
+                }
+                node.text().to_string()
+            } else {
+                continue;
+            };
+
+            if let Some(return_type) = self.function_return_types.get(&called_func) {
+                log::debug!(
+                    "Tracked return value assignment at module level: {} = {}() -> service '{}'",
+                    var_name,
+                    called_func,
+                    return_type.service_name
+                );
+                self.module_scope.insert(var_name, return_type.clone());
+            }
+        }
+    }
+
     /// Extract string content from a string literal
     ///
     /// Handles both single and double quotes:
@@ -923,4 +1239,32 @@ fn is_method(
         return false;
     }
     false
+}
+
+/// Count all return statements in a function, excluding those in nested functions.
+/// Uses tree-sitter node kind traversal to reliably catch both `return expr` and
+/// bare `return` statements.
+fn count_return_statements(
+    func_match: &ast_grep_core::NodeMatch<ast_grep_core::tree_sitter::StrDoc<Python>>,
+    func_node_id: usize,
+) -> usize {
+    count_returns_recursive(&func_match.get_node(), func_node_id)
+}
+
+fn count_returns_recursive(
+    node: &ast_grep_core::Node<ast_grep_core::tree_sitter::StrDoc<Python>>,
+    func_node_id: usize,
+) -> usize {
+    let mut count = 0;
+    for child in node.children() {
+        if child.kind() == node_kinds::FUNCTION_DEFINITION && child.node_id() != func_node_id {
+            continue;
+        }
+        if child.kind() == "return_statement" {
+            count += 1;
+        } else {
+            count += count_returns_recursive(&child, func_node_id);
+        }
+    }
+    count
 }

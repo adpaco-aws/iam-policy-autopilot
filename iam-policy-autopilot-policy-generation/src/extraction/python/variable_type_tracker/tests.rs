@@ -182,10 +182,58 @@ def create_clients():
     );
 }
 
-#[test]
-fn test_return_value_not_tracked() {
-    // Return value tracking is not yet supported — documenting the limitation.
-    let source_code = r#"
+// ========== Function Return Value Tracking Tests (parameterized) ==========
+
+#[rstest]
+#[case(
+    "direct boto3.client return",
+    r#"
+import boto3
+
+def create_client():
+    return boto3.client('s3')
+
+client = create_client()
+"#,
+    "client",
+    None,
+    "s3",
+    SdkObjectKind::Client
+)]
+#[case(
+    "direct boto3.resource return",
+    r#"
+import boto3
+
+def get_dynamodb():
+    return boto3.resource('dynamodb')
+
+ddb = get_dynamodb()
+"#,
+    "ddb",
+    None,
+    "dynamodb",
+    SdkObjectKind::Resource
+)]
+#[case(
+    "return tracked variable",
+    r#"
+import boto3
+
+def make_client():
+    client = boto3.client('ec2')
+    return client
+
+ec2 = make_client()
+"#,
+    "ec2",
+    None,
+    "ec2",
+    SdkObjectKind::Client
+)]
+#[case(
+    "return session.client with function-scoped session",
+    r#"
 import boto3
 
 def create_client():
@@ -193,13 +241,234 @@ def create_client():
     return session.client('s3')
 
 client = create_client()
+"#,
+    "client",
+    None,
+    "s3",
+    SdkObjectKind::Client
+)]
+#[case(
+    "return session.client with module-level session",
+    r#"
+import boto3
+
+session = boto3.Session(region_name='us-east-1')
+
+def create_client():
+    return session.client('s3')
+
+client = create_client()
+"#,
+    "client",
+    None,
+    "s3",
+    SdkObjectKind::Client
+)]
+#[case(
+    "consistent multiple returns",
+    r#"
+import boto3
+
+def create_client(region):
+    if region == 'us-east-1':
+        return boto3.client('s3')
+    return boto3.client('s3')
+
+client = create_client('us-east-1')
+"#,
+    "client",
+    None,
+    "s3",
+    SdkObjectKind::Client
+)]
+#[case(
+    "return with extra kwargs",
+    r#"
+import boto3
+
+def create_client(region):
+    return boto3.client('s3', region_name=region)
+
+client = create_client('us-east-1')
+"#,
+    "client",
+    None,
+    "s3",
+    SdkObjectKind::Client
+)]
+#[case(
+    "nested function does not confuse outer return",
+    r#"
+import boto3
+
+def outer():
+    def inner():
+        return boto3.client('ec2')
+    return boto3.client('s3')
+
+client = outer()
+"#,
+    "client",
+    None,
+    "s3",
+    SdkObjectKind::Client
+)]
+#[case(
+    "return value used inside another function",
+    r#"
+import boto3
+
+def create_s3():
+    return boto3.client('s3')
+
+def upload():
+    client = create_s3()
+    client.put_object(Bucket='b', Key='k', Body=b'data')
+"#,
+    "client",
+    Some("upload"),
+    "s3",
+    SdkObjectKind::Client
+)]
+fn test_return_value_tracked(
+    #[case] _description: &str,
+    #[case] source_code: &str,
+    #[case] var_name: &str,
+    #[case] context: Option<&str>,
+    #[case] expected_service: &str,
+    #[case] expected_kind: SdkObjectKind,
+) {
+    let ast = create_ast(source_code);
+    let mut tracker = VariableTypeTracker::new();
+    tracker.track_boto3_assignments(&ast);
+
+    let info = tracker
+        .get_type_info_for_variable_in_context(var_name, context)
+        .unwrap();
+    assert_eq!(info.service_name, expected_service);
+    assert_eq!(info.kind, Some(expected_kind));
+}
+
+#[rstest]
+#[case(
+    "ambiguous returns (different services)",
+    r#"
+import boto3
+
+def create_client(use_s3):
+    if use_s3:
+        return boto3.client('s3')
+    return boto3.client('ec2')
+
+client = create_client(True)
+"#,
+    "client",
+    None
+)]
+#[case(
+    "non-boto3 function return",
+    r#"
+import boto3
+
+def get_config():
+    return {"key": "value"}
+
+config = get_config()
+"#,
+    "config",
+    None
+)]
+#[case(
+    "method return (inside class) not tracked",
+    r#"
+import boto3
+
+class Factory:
+    def create(self):
+        return boto3.client('s3')
+
+client = create()
+"#,
+    "client",
+    None
+)]
+#[case(
+    "bare return makes type uncertain",
+    r#"
+import boto3
+
+def maybe_create(flag):
+    if not flag:
+        return
+    return boto3.client('s3')
+
+client = maybe_create(True)
+"#,
+    "client",
+    None
+)]
+#[case(
+    "return untracked variable makes type uncertain",
+    r#"
+import boto3
+
+def create_or_default(flag, default_client):
+    if not flag:
+        return default_client
+    return boto3.client('s3')
+
+client = create_or_default(True, None)
+"#,
+    "client",
+    None
+)]
+#[case(
+    "return arbitrary expression makes type uncertain",
+    r#"
+import boto3
+
+def create_client():
+    return get_client_from_pool()
+
+client = create_client()
+"#,
+    "client",
+    None
+)]
+fn test_return_value_not_tracked(
+    #[case] _description: &str,
+    #[case] source_code: &str,
+    #[case] var_name: &str,
+    #[case] context: Option<&str>,
+) {
+    let ast = create_ast(source_code);
+    let mut tracker = VariableTypeTracker::new();
+    tracker.track_boto3_assignments(&ast);
+
+    assert!(tracker
+        .get_type_info_for_variable_in_context(var_name, context)
+        .is_none());
+}
+
+#[test]
+fn test_return_value_does_not_override_direct_assignment() {
+    let source_code = r#"
+import boto3
+
+def create_client():
+    return boto3.client('s3')
+
+client = boto3.client('ec2')
 "#;
     let ast = create_ast(source_code);
     let mut tracker = VariableTypeTracker::new();
     tracker.track_boto3_assignments(&ast);
 
-    // The return value of create_client() is not tracked
-    assert!(tracker.get_service_for_variable("client").is_none());
+    // Direct assignment takes priority over return value tracking
+    assert_eq!(
+        tracker.get_service_for_variable("client"),
+        Some(&"ec2".to_string())
+    );
 }
 
 #[test]
